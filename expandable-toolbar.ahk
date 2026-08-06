@@ -4,6 +4,7 @@
 ; expandable-toolbar · 可扩展桌面小工具条 (AutoHotkey v2)
 ; 常驻置顶的横排图标工具条：点图标展开对应小面板、用完自动收回。跟终端无关
 ; (Tabby / Windows Terminal / PowerShell / cmd 都能用)，不用管理员权限。
+; 收起后停几秒会自动缩成一个半透明"工具球"(点一下展开回来)，避免长期占地方、少挡内容。
 ; 仓库：https://github.com/yiren-pacvue/expandable-toolbar
 ;
 ; 内置三个工具（往下面 gTools 列表加一项即可扩展新工具）：
@@ -50,6 +51,14 @@ IconFont      := "Segoe Fluent Icons"  ; Win11 自带线条图标字体（若显
 ActivateWindowUnderIcon := true  ; 点图标展开时自动激活图标正下方的窗口(通常是 Claude 终端)，避免插错窗口
 KeepOnTopMs   := 800      ; 每隔多久把当前可见窗口重新顶回"置顶层"最上面(毫秒)；防被别的置顶窗口盖住。设 0 关闭
 SnipMaxRows   := 7        ; 命令片段面板最多显示几行，超过就出滚动条、滚轮翻
+; ---- 收起后自动缩成"工具球"（半透明气泡，点一下变回工具条）----
+EnableBubble  := true     ; 开关：收起状态(没展开面板)停留几秒后自动缩成气泡
+BubbleDelayMs := 1500     ; 收起后多久缩成气泡（毫秒）
+BubbleSize    := 34       ; 气泡直径（像素）
+BubbleAlpha   := 128      ; 气泡不透明度 0-255（128≈50%，越小越通透）
+BubbleRing    := 3        ; 边缘对比圈宽度（像素）
+BubbleColor   := "F5F6F8" ; 气泡主体色
+BubbleRingCol := "3A7BD5" ; 边缘对比圈颜色（选醒目色，半透明下也好定位）
 ; ---- 终端里用 Shift+滚轮 滚动 Claude 对话（绕过全屏滚轮失效）----
 EnableShiftWheelScroll := true    ; 开关：在终端窗口里 Shift+滚轮 = 滚动 Claude 对话
 PlainWheelScroll       := false   ; 进一步：不按 Shift 直接滚轮滚动（会覆盖滚轮原本的翻历史）；默认关
@@ -71,6 +80,7 @@ global gSnipCtrlIdx := Map(), gSnipScroll := 0   ; 片段卡片控件 hwnd→序
 global gEditing := false   ; 正在弹"添加/编辑片段"对话框：期间 TrackActive/KeepOnTop 都让路
 global tzGui := "", gTzVisible := false, gTzInput := "", gTzOut := ""   ; 时间戳转时区工具
 global gActivePanel := ""   ; 当前展开的是哪个面板：""=没展开 / "thumb" / "snip" / "tz"（工具条常驻）
+global bubbleGui := "", bubbleCore := "", gBubbleVisible := false   ; "工具球"：外圈不透明对比环 + 内圆半透明 + 中心"工"字
 
 ; ---- 从同目录 ini 读取覆盖 ----
 IniPath := A_ScriptDir "\截图面板.ini"
@@ -101,6 +111,7 @@ if (KeepOnTopMs > 0)
     SetTimer(KeepOnTop, KeepOnTopMs)   ; 定期重新置顶，防被别的置顶窗口盖到底层
 OnMessage(0x201, IconLDown)     ; WM_LBUTTONDOWN：小图标的点击/拖动
 OnMessage(0x201, SnipLDown)     ; WM_LBUTTONDOWN：片段卡片的点击(插入)/上下拖(排序)
+OnMessage(0x201, BubbleLDown)   ; WM_LBUTTONDOWN：工具球的点击(展开)/拖动
 OnExit(SaveState)
 
 ; ---- 注册"终端里 Shift+滚轮翻页"热键 ----
@@ -412,7 +423,8 @@ PlacePanelByBar(&x, &y, w, h) {
 
 ; 确保工具条已创建并显示在 gPosX/gPosY（常驻，不再随面板隐藏）
 ShowBar() {
-    global iconGui, gPosX, gPosY, gIconW, gIconH, IconRadius
+    global iconGui, gPosX, gPosY, gIconW, gIconH, IconRadius, gActivePanel, EnableBubble, BubbleDelayMs
+    HideBubble()          ; 从气泡切回工具条：先收掉气泡
     if (iconGui = "")
         CreateIcon()
     ix := (gPosX != "") ? gPosX : (A_ScreenWidth - gIconW - 20)
@@ -420,6 +432,11 @@ ShowBar() {
     ClampToScreen(&ix, &iy, gIconW, gIconH)
     iconGui.Show("x" ix " y" iy " w" gIconW " h" gIconH " NoActivate")
     RoundWindow(iconGui.Hwnd, IconRadius)
+    ; 收起状态(没展开面板)时，过几秒自动缩成气泡；有面板展开则取消
+    if (EnableBubble && gActivePanel = "")
+        SetTimer(ShrinkToBubble, -BubbleDelayMs)
+    else
+        SetTimer(ShrinkToBubble, 0)
 }
 
 ; 拖动工具条后，把当前展开的面板一起挪到工具条新位置旁
@@ -443,6 +460,103 @@ RepositionActivePanel() {
 ; 把某窗口塞回置顶层最上面（不抢焦点、不移位、不改大小）
 Topmost(hwnd) {
     DllCall("SetWindowPos", "Ptr", hwnd, "Ptr", -1, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", 0x13)
+}
+
+; ---- 工具球（收起后的半透明气泡）----
+; 收起状态(只剩工具条、没展开面板)停留一段时间后，把工具条缩成一个半透明小圆球，
+; 半透明避免长期挡住下方内容，边缘留一圈醒目对比色帮你定位；点一下气泡就展开回工具条。
+ShrinkToBubble() {
+    global gActivePanel, iconGui, gBubbleVisible
+    if (gActivePanel != "" || gBubbleVisible)   ; 有面板展开 / 已经是气泡 → 不缩
+        return
+    if (iconGui != "")
+        try iconGui.Hide()
+    ShowBubble()
+}
+
+; 显示气泡（两层）：
+;   外圈 bubbleGui = 不透明的对比色"环"(环形窗，中心镂空) → 白底也看得见轮廓；
+;   内圆 bubbleCore = 半透明圆(通透、少挡内容) + 中心不透明"工"字(标识这是工具条)。
+; 两层拼成一个完整圆：环在最外一圈、内圆填中间。位置与工具条共用 gPosX/gPosY。
+ShowBubble() {
+    global bubbleGui, bubbleCore, gBubbleVisible, gPosX, gPosY, gIconW
+    global BubbleSize, BubbleAlpha, BubbleRing, BubbleColor, BubbleRingCol, IconFont
+    D := BubbleSize, ring := BubbleRing
+    ringPx := Round(ring * (A_ScreenDPI / 96))
+    bx := (gPosX != "") ? gPosX : (A_ScreenWidth - gIconW - 20)
+    by := (gPosY != "") ? gPosY : 100
+    ClampToScreen(&bx, &by, D, D)
+    if (bubbleGui = "") {   ; 外圈环：不透明强对比色
+        bubbleGui := Gui("+AlwaysOnTop +ToolWindow -Caption +E0x08000000", "工具球")
+        bubbleGui.MarginX := 0, bubbleGui.MarginY := 0
+        bubbleGui.BackColor := BubbleRingCol
+    }
+    if (bubbleCore = "") {   ; 内圆：半透明球体 + 居中"工"字(不透明子控件；工字用普通字体，非图标字体)
+        bubbleCore := Gui("+AlwaysOnTop +ToolWindow -Caption +E0x08000000")
+        bubbleCore.MarginX := 0, bubbleCore.MarginY := 0
+        bubbleCore.BackColor := BubbleColor
+        d2 := D - 2 * ring
+        bubbleCore.SetFont("s" Round(D * 0.42) " c" BubbleRingCol, IconFont)   ; 用工具条同款图标字体
+        bubbleCore.Add("Text", "x0 y0 w" d2 " h" d2 " Center 0x200 BackgroundTrans", Chr(0xE90F))  ; E90F=扳手(代表工具)
+    }
+    bubbleGui.Show("x" bx " y" by " w" D " h" D " NoActivate")
+    RingWindow(bubbleGui.Hwnd, ringPx)                  ; 外圈裁成环(中心镂空)，不设半透明→白底也可见
+    d2 := D - 2 * ring
+    bubbleCore.Show("x" (bx + ring) " y" (by + ring) " w" d2 " h" d2 " NoActivate")
+    RoundWindow(bubbleCore.Hwnd, d2 // 2)               ; 内圆
+    WinSetTransparent(BubbleAlpha, bubbleCore.Hwnd)     ; 内圆半透明(通透)
+    gBubbleVisible := true
+}
+
+HideBubble() {
+    global bubbleGui, bubbleCore, gBubbleVisible
+    if (bubbleGui != "")
+        try bubbleGui.Hide()
+    if (bubbleCore != "")
+        try bubbleCore.Hide()
+    gBubbleVisible := false
+}
+
+; 气泡按下左键：几乎没动=点击→展开成工具条；动了=拖动(更新位置，球和条共用 gPosX/gPosY)
+; 气泡按下左键：手动拖动(外圈+内球两层同时移动，始终贴合)；几乎没动=点击→展开成工具条。
+; 不用系统 WM_NCLBUTTONDOWN 拖动，因为那只拖一个窗口、另一层会分家。
+BubbleLDown(wParam, lParam, msg, hwnd) {
+    global bubbleGui, bubbleCore, gBubbleVisible, gPosX, gPosY, IniPath, BubbleRing
+    static busy := false
+    if (bubbleGui = "" || !gBubbleVisible || busy)
+        return
+    MouseGetPos(&mx0, &my0, &winId)
+    if (winId != bubbleGui.Hwnd && winId != bubbleCore.Hwnd)   ; 点外环或内圆都算
+        return
+    busy := true
+    ; 用物理坐标(GetWindowRect + SetWindowPos)：鼠标是物理像素，若用 Gui.Move(逻辑坐标)在高 DPI 下会漂移
+    rc := Buffer(16, 0)
+    DllCall("GetWindowRect", "Ptr", bubbleGui.Hwnd, "Ptr", rc)   ; 以外圈为基准
+    gx0 := NumGet(rc, 0, "Int"), gy0 := NumGet(rc, 4, "Int")
+    ringPx := Round(BubbleRing * (A_ScreenDPI / 96))
+    SWP := 0x15   ; SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE
+    moved := false
+    while GetKeyState("LButton", "P") {
+        MouseGetPos(&cx, &cy)
+        dx := cx - mx0, dy := cy - my0
+        if (!moved && (Abs(dx) > 2 || Abs(dy) > 2))
+            moved := true
+        if moved {   ; 两层一起移动，始终贴合
+            DllCall("SetWindowPos", "Ptr", bubbleGui.Hwnd, "Ptr", 0, "Int", gx0 + dx, "Int", gy0 + dy, "Int", 0, "Int", 0, "UInt", SWP)
+            DllCall("SetWindowPos", "Ptr", bubbleCore.Hwnd, "Ptr", 0, "Int", gx0 + dx + ringPx, "Int", gy0 + dy + ringPx, "Int", 0, "Int", 0, "UInt", SWP)
+        }
+        Sleep 10
+    }
+    busy := false
+    if !moved {
+        HideBubble()
+        ShowBar()          ; 点一下 → 展开回工具条
+    } else {
+        bubbleGui.GetPos(&ax, &ay)
+        gPosX := ax, gPosY := ay
+        try IniWrite(gPosX, IniPath, "pos", "X")
+        try IniWrite(gPosY, IniPath, "pos", "Y")
+    }
 }
 
 ; ============================== 面板构建 =====================================
@@ -626,7 +740,7 @@ InsertAndMinimize(text) {
 }
 
 TrackActive() {
-    global MyGui, snipGui, tzGui, iconGui, gTargetWin, gEditing
+    global MyGui, snipGui, tzGui, iconGui, gTargetWin, gEditing, bubbleGui
     if gEditing            ; 编辑对话框是本工具窗口，别把它记成插入目标
         return
     a := WinActive("A")
@@ -640,6 +754,8 @@ TrackActive() {
         return
     if (iconGui != "" && a = iconGui.Hwnd)
         return
+    if (bubbleGui != "" && a = bubbleGui.Hwnd)
+        return
     gTargetWin := a
 }
 
@@ -648,12 +764,17 @@ TrackActive() {
 ; 而多个置顶窗口之间按"最近激活"排序 → 别的置顶窗口一出现就会盖到本工具上面。
 ; 这里用 SetWindowPos(HWND_TOPMOST) + SWP_NOACTIVATE 定期把它顶回顶部：不抢焦点、不移位、不改大小。
 KeepOnTop() {
-    global MyGui, snipGui, tzGui, iconGui, gVisible, gSnipVisible, gTzVisible, gEditing
+    global MyGui, snipGui, tzGui, iconGui, gVisible, gSnipVisible, gTzVisible, gEditing, bubbleGui, bubbleCore, gBubbleVisible
     if gEditing            ; 编辑对话框开着时别顶，免得盖住对话框
         return
     ; 工具条常驻：先顶工具条
     if (iconGui != "" && DllCall("IsWindowVisible", "Ptr", iconGui.Hwnd))
         Topmost(iconGui.Hwnd)
+    if (gBubbleVisible && bubbleGui != "") {   ; 气泡两层都保持置顶(先外环、再内圆，内圆在上)
+        Topmost(bubbleGui.Hwnd)
+        if (bubbleCore != "")
+            Topmost(bubbleCore.Hwnd)
+    }
     ; 再顶当前展开的面板（放到工具条之上）
     if (gVisible && MyGui != "")
         Topmost(MyGui.Hwnd)
@@ -735,6 +856,19 @@ RoundWindow(hwnd, r) {
     hRgn := DllCall("CreateRoundRectRgn", "Int", 0, "Int", 0, "Int", w + 1, "Int", h + 1
         , "Int", rr, "Int", rr, "Ptr")
     DllCall("SetWindowRgn", "Ptr", hwnd, "Ptr", hRgn, "Int", 1)   ; 系统接管并释放该区域
+}
+
+; 把窗口裁成"圆环"（外圆挖掉内圆）——给气泡的外圈描边用；ringPx 是环宽(物理像素)
+RingWindow(hwnd, ringPx) {
+    rc := Buffer(16, 0)
+    DllCall("GetWindowRect", "Ptr", hwnd, "Ptr", rc.Ptr)
+    w := NumGet(rc, 8, "Int") - NumGet(rc, 0, "Int")
+    h := NumGet(rc, 12, "Int") - NumGet(rc, 4, "Int")
+    hOuter := DllCall("CreateEllipticRgn", "Int", 0, "Int", 0, "Int", w + 1, "Int", h + 1, "Ptr")
+    hInner := DllCall("CreateEllipticRgn", "Int", ringPx, "Int", ringPx, "Int", w + 1 - ringPx, "Int", h + 1 - ringPx, "Ptr")
+    DllCall("CombineRgn", "Ptr", hOuter, "Ptr", hOuter, "Ptr", hInner, "Int", 4)   ; RGN_DIFF=4：外圆减内圆=环
+    DllCall("DeleteObject", "Ptr", hInner)
+    DllCall("SetWindowRgn", "Ptr", hwnd, "Ptr", hOuter, "Int", 1)
 }
 
 ; 小图标按下左键：用系统原生拖动(DPI 安全、跟手)。松开后按位移判断：
@@ -1308,9 +1442,12 @@ CopyTz(ctrl, *) {
 
 ; ============================== 退出保存 =====================================
 SaveState(*) {
-    global iconGui, IniPath, Folder, gPosX, gPosY
+    global iconGui, IniPath, Folder, gPosX, gPosY, bubbleGui, gBubbleVisible
     try {
-        if (iconGui != "") {           ; 工具条常驻：存工具条位置
+        if (gBubbleVisible && bubbleGui != "") {   ; 气泡状态：存气泡位置
+            bubbleGui.GetPos(&bx, &by)
+            gPosX := bx, gPosY := by
+        } else if (iconGui != "") {                ; 否则存工具条位置
             iconGui.GetPos(&ix, &iy)
             gPosX := ix, gPosY := iy
         }
