@@ -8,7 +8,8 @@
 ; 仓库：https://github.com/yiren-pacvue/expandable-toolbar
 ;
 ; 内置三个工具（往下面 gTools 列表加一项即可扩展新工具）：
-;   · 截图缩略图面板  盯截图文件夹，点缩略图把图片绝对路径插入当前窗口
+;   · 截图缩略图面板  盯截图文件夹，点缩略图把图片绝对路径插入当前窗口；
+;                     右键缩略图看原图(左键点=插入 / 左键按住拖=移动 / 右键=关闭)
 ;   · 命令/文字片段   预存片段点击插入；支持别名 / 多行 / 文本或 .ps1 脚本两种模式 / 拖动排序 / 滚动
 ;   · 时间戳转时区    填秒级时间戳，实时显示 中国(UTC+8) / UTC / PST(-8) / PDT(-7)
 ;
@@ -37,6 +38,8 @@ ToggleKey     := "^!i"    ; 面板↔图标 热键（Ctrl+Alt+I）
 RefreshMs     := 1500     ; 自动检查文件夹变化的间隔（毫秒）
 ImgExts       := "png,jpg,jpeg,gif,bmp,webp"  ; 认作图片的扩展名
 HeaderH       := 44       ; 顶部工具条高度
+; ---- 右键缩略图看原图（预览里 左键点=插入路径 / 右键点=关闭）----
+PreviewMaxRatio   := 0.9  ; 原图最多占所在屏幕的比例（留点边，别顶满）
 ; ---- 最小化后的"小工具条"外观（以后可加更多小工具）----
 IconCell      := 32       ; 每个小图标格子的"宽"（决定横向间距/宽度）
 IconRowH      := 24       ; 图标行"高"（决定工具条上下高度；越小越扁）
@@ -81,6 +84,7 @@ global gEditing := false   ; 正在弹"添加/编辑片段"对话框：期间 Tr
 global tzGui := "", gTzVisible := false, gTzInput := "", gTzOut := ""   ; 时间戳转时区工具
 global gActivePanel := ""   ; 当前展开的是哪个面板：""=没展开 / "thumb" / "snip" / "tz"（工具条常驻）
 global bubbleGui := "", bubbleCore := "", gBubbleVisible := false   ; "工具球"：外圈不透明对比环 + 内圆半透明 + 中心"工"字
+global previewGui := "", gPreviewPath := ""   ; 右键看原图：预览窗 + 当前图路径（左键点=插入/按住拖=移动，右键=关闭）
 
 ; ---- 从同目录 ini 读取覆盖 ----
 IniPath := A_ScriptDir "\截图面板.ini"
@@ -112,6 +116,7 @@ if (KeepOnTopMs > 0)
 OnMessage(0x201, IconLDown)     ; WM_LBUTTONDOWN：小图标的点击/拖动
 OnMessage(0x201, SnipLDown)     ; WM_LBUTTONDOWN：片段卡片的点击(插入)/上下拖(排序)
 OnMessage(0x201, BubbleLDown)   ; WM_LBUTTONDOWN：工具球的点击(展开)/拖动
+OnMessage(0x201, PreviewLDown)  ; WM_LBUTTONDOWN：原图预览的点击(插入)/按住拖(移动)
 OnExit(SaveState)
 
 ; ---- 注册"终端里 Shift+滚轮翻页"热键 ----
@@ -624,6 +629,7 @@ Rebuild(*) {
             ; 点在留白上也能命中这个可点区 → 修"有时点了插不进去"。
             hit := MyGui.Add("Text", "x0 y0 w" ThumbW " h" ThumbH " 0x100")
             hit.OnEvent("Click", InsertPath.Bind(f.path))
+            hit.OnEvent("ContextMenu", ShowPreview.Bind(f.path))   ; 右键 → 看原图
             item.hit := hit
             hbm := GetScaledBitmap(f.path, f.mtime, fit.w, fit.h)
             if hbm {
@@ -631,6 +637,7 @@ Rebuild(*) {
                 ; HBITMAP:* 里的 * = 复用缓存位图、控件销毁时不释放它(由 PrunePicCache 统一管)
                 pic := MyGui.Add("Picture", "x0 y0 w" fit.w " h" fit.h, "HBITMAP:*" hbm)
                 pic.OnEvent("Click", InsertPath.Bind(f.path))
+                pic.OnEvent("ContextMenu", ShowPreview.Bind(f.path))   ; 右键 → 看原图
                 item.pic := pic
             } else {
                 ph := MyGui.Add("Text", "x0 y0 w" ThumbW " h" ThumbH " Border Center 0x200", "(读不出)")
@@ -640,6 +647,7 @@ Rebuild(*) {
             }
             lbl := MyGui.Add("Text", "x0 y0 w" ThumbW " Center 0x100", ShortLabel(f.name))
             lbl.OnEvent("Click", InsertPath.Bind(f.path))
+            lbl.OnEvent("ContextMenu", ShowPreview.Bind(f.path))   ; 右键 → 看原图
             item.lbl := lbl
             gItems.Push(item)
         }
@@ -715,6 +723,95 @@ InsertPath(path, *) {
     InsertAndMinimize(text)
 }
 
+; ============================== 右键看原图 ===================================
+; 右键缩略图 → 在鼠标所在的那块屏幕居中显示原图（无边框、置顶、不抢焦点）。
+; 预览开着时：左键点图=插入路径；左键按住拖=移动原图位置；右键点图=关掉预览。
+; 鼠标移动(不按键)、键盘都不管。左键的"点击 vs 拖动"由 PreviewLDown 区分。
+ShowPreview(path, *) {
+    global previewGui, gPreviewPath, PreviewMaxRatio
+    ClosePreview()                       ; 同一时间只留一个预览
+    if !FileExist(path)
+        return
+    mtime := ""
+    try mtime := FileGetTime(path, "M")
+    sz := GetImageSize(path, mtime)
+    MouseGetPos(&mx, &my)
+    GetMonitorAt(mx, my, &monL, &monT, &monR, &monB)   ; 鼠标所在屏幕
+    availW := Round((monR - monL) * PreviewMaxRatio)
+    availH := Round((monB - monT) * PreviewMaxRatio)
+    fit := FitBox(sz.w, sz.h, availW, availH)           ; 按原比例缩进屏幕(不放大小图)
+    winW := Max(1, fit.w), winH := Max(1, fit.h)
+    if (sz.w <= 0 || sz.h <= 0) {                       ; 读不出尺寸就给个兜底大小
+        winW := Min(availW, 800), winH := Min(availH, 600)
+    }
+    winX := monL + ((monR - monL) - winW) // 2
+    winY := monT + ((monB - monT) - winH) // 2
+
+    previewGui := Gui("+AlwaysOnTop -Caption +ToolWindow", "原图预览")
+    previewGui.Opt("+E0x08000000")                      ; WS_EX_NOACTIVATE：不抢焦点
+    previewGui.BackColor := "202020"
+    previewGui.MarginX := 0, previewGui.MarginY := 0
+    gPreviewPath := path
+    pic := previewGui.Add("Picture", "x0 y0 w" winW " h" winH, path)   ; Picture 控件自动解码+缩放
+    pic.OnEvent("ContextMenu", (*) => ClosePreview())   ; 右键 → 关掉预览（左键交给 PreviewLDown）
+    previewGui.Show("x" winX " y" winY " w" winW " h" winH " NoActivate")
+    Topmost(previewGui.Hwnd)
+}
+
+; 预览窗按下左键：几乎没动=点击→插入这张图的路径；动了=按住拖动，移动原图窗口位置。
+; 拖动用物理坐标(GetWindowRect + SetWindowPos)，避开高 DPI 下 Gui.Move 逻辑坐标漂移（同工具球做法）。
+PreviewLDown(wParam, lParam, msg, hwnd) {
+    global previewGui, gPreviewPath
+    static busy := false
+    if (previewGui = "" || busy)
+        return
+    MouseGetPos(&mx0, &my0, &winId)
+    if (winId != previewGui.Hwnd)          ; 只处理落在预览窗上的左键
+        return
+    busy := true
+    rc := Buffer(16, 0)
+    DllCall("GetWindowRect", "Ptr", previewGui.Hwnd, "Ptr", rc)
+    gx0 := NumGet(rc, 0, "Int"), gy0 := NumGet(rc, 4, "Int")
+    SWP := 0x15   ; SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE
+    moved := false
+    while GetKeyState("LButton", "P") {
+        MouseGetPos(&cx, &cy)
+        dx := cx - mx0, dy := cy - my0
+        if (!moved && (Abs(dx) > 4 || Abs(dy) > 4))
+            moved := true
+        if moved                            ; 子控件(图片)随顶层窗一起移，只挪顶层窗即可
+            DllCall("SetWindowPos", "Ptr", previewGui.Hwnd, "Ptr", 0, "Int", gx0 + dx, "Int", gy0 + dy, "Int", 0, "Int", 0, "UInt", SWP)
+        Sleep 10
+    }
+    busy := false
+    if !moved {                             ; 几乎没动 = 点击 → 插入这张图的路径（先关预览再走插入+收起）
+        path := gPreviewPath
+        ClosePreview()
+        InsertPath(path)
+    }
+    ; 拖动过：预览就停在新位置，不记 ini（临时窗，下次右键按鼠标所在屏重新居中）
+}
+
+ClosePreview() {
+    global previewGui
+    if (previewGui != "") {
+        try previewGui.Destroy()
+        previewGui := ""
+    }
+}
+
+; 找包含点 (px,py) 的那块屏幕(整屏范围)；找不到就退回主屏
+GetMonitorAt(px, py, &l, &t, &r, &b) {
+    Loop MonitorGetCount() {
+        MonitorGet(A_Index, &ml, &mt, &mr, &mb)
+        if (px >= ml && px < mr && py >= mt && py < mb) {
+            l := ml, t := mt, r := mr, b := mb
+            return
+        }
+    }
+    MonitorGet(MonitorGetPrimary(), &l, &t, &r, &b)
+}
+
 ; 统一的"插入即收起"流程（缩略图/片段共用）：
 ;   1) 激活目标窗口(=展开面板时记下的"工具正下方"那个窗口，通常是 Claude 终端)；
 ;   2) 把文字打进去；
@@ -764,7 +861,7 @@ TrackActive() {
 ; 而多个置顶窗口之间按"最近激活"排序 → 别的置顶窗口一出现就会盖到本工具上面。
 ; 这里用 SetWindowPos(HWND_TOPMOST) + SWP_NOACTIVATE 定期把它顶回顶部：不抢焦点、不移位、不改大小。
 KeepOnTop() {
-    global MyGui, snipGui, tzGui, iconGui, gVisible, gSnipVisible, gTzVisible, gEditing, bubbleGui, bubbleCore, gBubbleVisible
+    global MyGui, snipGui, tzGui, iconGui, gVisible, gSnipVisible, gTzVisible, gEditing, bubbleGui, bubbleCore, gBubbleVisible, previewGui
     if gEditing            ; 编辑对话框开着时别顶，免得盖住对话框
         return
     ; 工具条常驻：先顶工具条
@@ -782,6 +879,8 @@ KeepOnTop() {
         Topmost(snipGui.Hwnd)
     else if (gTzVisible && tzGui != "")
         Topmost(tzGui.Hwnd)
+    if (previewGui != "")   ; 原图预览最优先：放在最后顶，压在面板/工具条之上
+        Topmost(previewGui.Hwnd)
 }
 
 RefreshIfChanged() {
@@ -797,6 +896,7 @@ RefreshIfChanged() {
 Minimize(*) {
     global MyGui, snipGui, tzGui, gVisible, gSnipVisible, gTzVisible, gActivePanel, gArmedMinimize
     gArmedMinimize := false
+    ClosePreview()     ; 收起/切换面板时，顺手关掉可能还开着的原图预览
     if (MyGui != "")
         try MyGui.Hide()
     if (snipGui != "")
