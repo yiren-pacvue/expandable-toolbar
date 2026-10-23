@@ -11,11 +11,12 @@
 ;   · 截图缩略图面板  盯截图文件夹，点缩略图把图片绝对路径插入当前窗口；
 ;                     右键缩略图看原图(左键点=插入 / 左键按住拖=移动 / 右键=关闭)
 ;   · 命令/文字片段   预存片段点击插入；支持别名 / 多行 / 文本或 .ps1 脚本两种模式 / 拖动排序 / 滚动
-;   · 时间戳转时区    填秒级时间戳，实时显示 中国(UTC+8) / UTC / PST(-8) / PDT(-7)
+;   · 时间戳 ⇄ 日期   一个输入框自动识别：填时间戳(秒/13 位毫秒)显示各时区时间；填日期(多种写法、
+;                     可带 Z / +08:00)按所选时区换算成秒/毫秒时间戳。中国 / UTC / PST / PDT，整行点击即复制
 ;
 ; 工具条交互：
 ;   · 点某图标 → 展开它的面板(贴在工具条正下方，下方不够翻上)；再点该图标收起；点别的图标切换
-;   · 拖动工具条挪位置(展开的面板会跟随)；支持双屏 + 高 DPI 缩放
+;   · 拖工具条或拖面板标题栏，另一个实时跟着走；支持双屏 + 高 DPI 缩放
 ;   · Ctrl+Alt+I → 面板 ↔ 工具条 来回切；托盘图标右键有更多菜单
 ;
 ; 命令行参数：/min 最小化启动(开机自启用)；/install、/uninstall 装/卸开机自启。
@@ -82,6 +83,10 @@ global snipGui := "", gSnips := [], gSnipVisible := false          ; 命令/文�
 global gSnipCtrlIdx := Map(), gSnipScroll := 0   ; 片段卡片控件 hwnd→序号 + 滚动偏移(跳过前几条)
 global gEditing := false   ; 正在弹"添加/编辑片段"对话框：期间 TrackActive/KeepOnTop 都让路
 global tzGui := "", gTzVisible := false, gTzInput := "", gTzOut := ""   ; 时间戳转时区工具
+global gDragPair := ""                                                  ; 拖动联动：{lead, follower, dx, dy}，lead=被拖的窗口
+global gTzCopyHwnds := Map()                                          ; 时间面板里可点复制的控件 hwnd
+global gTzZoneRadios := [], gTzHint := ""                              ; 日期时区单选按钮、识别结果提示
+global TzZones := [["中国 (UTC+8)", 8], ["UTC", 0], ["PST (UTC-8)", -8], ["PDT (UTC-7)", -7]]
 global gActivePanel := ""   ; 当前展开的是哪个面板：""=没展开 / "thumb" / "snip" / "tz"（工具条常驻）
 global bubbleGui := "", bubbleCore := "", gBubbleVisible := false   ; "工具球"：外圈不透明对比环 + 内圆半透明 + 中心"工"字
 global previewGui := "", gPreviewPath := ""   ; 右键看原图：预览窗 + 当前图路径（左键点=插入/按住拖=移动，右键=关闭）
@@ -117,6 +122,10 @@ OnMessage(0x201, IconLDown)     ; WM_LBUTTONDOWN：小图标的点击/拖动
 OnMessage(0x201, SnipLDown)     ; WM_LBUTTONDOWN：片段卡片的点击(插入)/上下拖(排序)
 OnMessage(0x201, BubbleLDown)   ; WM_LBUTTONDOWN：工具球的点击(展开)/拖动
 OnMessage(0x201, PreviewLDown)  ; WM_LBUTTONDOWN：原图预览的点击(插入)/按住拖(移动)
+OnMessage(0x20, TzSetCursor)    ; WM_SETCURSOR：时间面板数据行显示手形光标
+OnMessage(0x231, PairEnterMove) ; WM_ENTERSIZEMOVE：开始拖工具条/面板，记相对位置
+OnMessage(0x3, PairMove)        ; WM_MOVE：拖动中另一个实时跟着走
+OnMessage(0x232, PairExitMove)  ; WM_EXITSIZEMOVE：拖完
 OnExit(SaveState)
 
 ; ---- 注册"终端里 Shift+滚轮翻页"热键 ----
@@ -444,22 +453,65 @@ ShowBar() {
         SetTimer(ShrinkToBubble, 0)
 }
 
-; 拖动工具条后，把当前展开的面板一起挪到工具条新位置旁
-RepositionActivePanel() {
+; 当前展开的面板 Gui；没展开返回 ""
+ActivePanelGui() {
     global gActivePanel, MyGui, snipGui, tzGui
-    pane := ""
     if (gActivePanel = "thumb" && MyGui != "")
-        pane := MyGui
-    else if (gActivePanel = "snip" && snipGui != "")
-        pane := snipGui
-    else if (gActivePanel = "tz" && tzGui != "")
-        pane := tzGui
-    if (pane = "")
+        return MyGui
+    if (gActivePanel = "snip" && snipGui != "")
+        return snipGui
+    if (gActivePanel = "tz" && tzGui != "")
+        return tzGui
+    return ""
+}
+
+; ---- 工具条和展开的面板拖动时连在一起 ----
+; 拖其中一个(工具条走 IconLDown 的系统拖动，面板拖标题栏)，另一个实时跟着走、相对位置不变。
+; 系统拖动开始发 WM_ENTERSIZEMOVE → 记下两者的相对偏移；拖动中每次 WM_MOVE → 把另一个挪到同样偏移处；
+; WM_EXITSIZEMOVE → 结束。全程用 GetWindowRect/SetWindowPos 的物理像素(Gui.Move 是逻辑坐标，高 DPI 会漂)。
+WinRectLT(hwnd, &l, &t) {
+    rc := Buffer(16, 0)
+    DllCall("GetWindowRect", "Ptr", hwnd, "Ptr", rc.Ptr)
+    l := NumGet(rc, 0, "Int"), t := NumGet(rc, 4, "Int")
+}
+
+PairEnterMove(wParam, lParam, msg, hwnd) {
+    global gDragPair, iconGui
+    pane := ActivePanelGui()
+    if (iconGui = "" || pane = "" || !DllCall("IsWindowVisible", "Ptr", iconGui.Hwnd))
         return
-    pane.GetPos(, , &pw, &ph)
-    x := 0, y := 0
-    PlacePanelByBar(&x, &y, pw, ph)
-    pane.Move(x, y)
+    if (hwnd = iconGui.Hwnd)
+        lead := iconGui.Hwnd, follower := pane.Hwnd
+    else if (hwnd = pane.Hwnd)
+        lead := pane.Hwnd, follower := iconGui.Hwnd
+    else
+        return
+    WinRectLT(lead, &ll, &lt)
+    WinRectLT(follower, &fl, &ft)
+    gDragPair := {lead: lead, follower: follower, dx: fl - ll, dy: ft - lt}
+}
+
+PairMove(wParam, lParam, msg, hwnd) {
+    global gDragPair
+    if (gDragPair = "" || hwnd != gDragPair.lead)
+        return
+    WinRectLT(hwnd, &ll, &lt)
+    ; SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE = 0x15
+    DllCall("SetWindowPos", "Ptr", gDragPair.follower, "Ptr", 0, "Int", ll + gDragPair.dx, "Int", lt + gDragPair.dy
+        , "Int", 0, "Int", 0, "UInt", 0x15)
+}
+
+PairExitMove(wParam, lParam, msg, hwnd) {
+    global gDragPair, iconGui, gPosX, gPosY, IniPath
+    if (gDragPair = "" || hwnd != gDragPair.lead)
+        return
+    gDragPair := ""
+    if (iconGui != "" && hwnd != iconGui.Hwnd) {   ; 拖的是面板：工具条被带走了，记下它的新位置
+        iconGui.GetPos(&ix, &iy)
+        gPosX := ix, gPosY := iy
+        try IniWrite(gPosX, IniPath, "pos", "X")
+        try IniWrite(gPosY, IniPath, "pos", "Y")
+    }
 }
 
 ; 把某窗口塞回置顶层最上面（不抢焦点、不移位、不改大小）
@@ -862,7 +914,7 @@ TrackActive() {
 ; 这里用 SetWindowPos(HWND_TOPMOST) + SWP_NOACTIVATE 定期把它顶回顶部：不抢焦点、不移位、不改大小。
 KeepOnTop() {
     global MyGui, snipGui, tzGui, iconGui, gVisible, gSnipVisible, gTzVisible, gEditing, bubbleGui, bubbleCore, gBubbleVisible, previewGui
-    if gEditing            ; 编辑对话框开着时别顶，免得盖住对话框
+    if gEditing          ; 编辑对话框开着时别顶，免得盖住对话框
         return
     ; 工具条常驻：先顶工具条
     if (iconGui != "" && DllCall("IsWindowVisible", "Ptr", iconGui.Hwnd))
@@ -921,7 +973,7 @@ CreateIcon() {
     gTools := [
         { icon: Chr(0xE722), tip: "展开截图面板", action: ExpandFromIcon, panel: "thumb" }   ; E722=相机
       , { icon: Chr(0xE70B), tip: "命令/文字片段", action: OpenSnippets, panel: "snip" }       ; E70B=便签
-      , { icon: Chr(0xE774), tip: "时间戳转时区", action: OpenTimeConverter, panel: "tz" }      ; E774=世界/地球
+      , { icon: Chr(0xE774), tip: "时间戳 ⇄ 日期（转时区）", action: OpenTimeConverter, panel: "tz" }      ; E774=世界/地球
     ]
     n := gTools.Length
     gIconW := IconPad * 2 + n * IconCell + (n - 1) * IconGap
@@ -1015,7 +1067,7 @@ IconLDown(wParam, lParam, msg, hwnd) {
         gPosX := ax, gPosY := ay
         try IniWrite(gPosX, IniPath, "pos", "X")
         try IniWrite(gPosY, IniPath, "pos", "Y")
-        RepositionActivePanel()          ; 工具条挪了，展开着的面板跟过去
+        ; 展开着的面板在拖动过程中已由 PairMove 实时带着走，这里不用再挪
     }
 }
 
@@ -1437,10 +1489,14 @@ InsertText(text, *) {
 }
 
 ; ============================== 时间戳转时区 ================================
-; 填入秒级时间戳(13 位当毫秒自动识别)，实时显示各时区时间。可常驻。
+; 一个输入框、双向自动识别：
+;   填时间戳（≤13 位纯数字；13 位当毫秒）→ 显示各时区时间
+;   填日期（2026-10-23 12:34:56 / 2026/10/23 12:34 / 2026年10月23日 / ISO 8601 / 14 位 20261023123456）
+;     → 按「日期时区」单选按钮选的时区（或日期自带的 Z / +08:00 后缀）换算成秒、毫秒时间戳，同时显示各时区时间
+; 每行点一下即复制。可常驻。
 OpenTimeConverter(*) {
     global tzGui, MyGui, snipGui, iconGui, gVisible, gSnipVisible, gTzVisible, gActivePanel
-    global gTzInput, gTzOut
+    global gTzInput, gTzOut, gTzZoneRadios, gTzHint, TzZones, gTzCopyHwnds
     Critical
 
     ; 关掉另外两个面板（同一时间只显示一个）
@@ -1457,27 +1513,52 @@ OpenTimeConverter(*) {
         tzGui := ""
     }
 
-    padX := 12, headerH := 44, rowH := 30, winW := 420
-    winH := headerH + 6 + 4 * rowH + 12
+    rowNames := ["秒时间戳", "毫秒时间戳"]
+    for z in TzZones
+        rowNames.Push(z[1])
 
-    tzGui := Gui("+AlwaysOnTop", "时间戳转时区")
+    padX := 12, headerH := 100, rowH := 30, winW := 460
+    winH := headerH + 6 + rowNames.Length * rowH + 12
+
+    tzGui := Gui("+AlwaysOnTop", "时间戳 ⇄ 日期")
     tzGui.SetFont("s10 c202020", "Segoe UI")
     tzGui.MarginX := padX, tzGui.MarginY := 8
 
-    tzGui.Add("Text", "x" padX " y13", "秒时间戳：")
-    gTzInput := tzGui.Add("Edit", "x+6 yp-3 w180", "")
+    tzGui.Add("Text", "x" padX " y13 w84", "时间戳/日期：")
+    gTzInput := tzGui.Add("Edit", "x+4 yp-3 w220", "")
     nowb := tzGui.Add("Button", "x+6 yp-1 w56 h26", "现在")
     mb := tzGui.Add("Button", "x" (winW - 36) " y8 w26 h26", "—")
 
+    ; 第二行：日期按哪个时区理解（填时间戳时不用管）。用单选按钮不用下拉框：
+    ; 下拉框在本工具里点开后不到 1 秒就自己收起（原因没查实），单选按钮没有弹出列表，也少点一下
+    tzGui.Add("Text", "x" padX " y47 w84", "日期时区：")
+    gTzZoneRadios := []
+    for i, z in TzZones {
+        ; "中国 (UTC+8)" → "中国 +8"，"UTC" → "UTC ±0"：名称后标出相对 UTC 差几小时
+        label := RegExReplace(z[1], "\s*\(.*\)$") " " (z[2] = 0 ? "±0" : z[2] > 0 ? "+" z[2] : z[2])
+        rb := tzGui.Add("Radio", (i = 1 ? "x+4 yp Group Checked" : "x+10 yp"), label)
+        rb.OnEvent("Click", (*) => RefreshTz())
+        gTzZoneRadios.Push(rb)
+    }
+    ; 第三行：识别结果提示
+    tzGui.SetFont("s9 c808080")
+    gTzHint := tzGui.Add("Text", "x" (padX + 88) " y72 w" (winW - padX - 88 - 8), "")
+    tzGui.SetFont("s10 c202020")
+
     gTzOut := Map()
-    zones := [["中国 (UTC+8)", 8], ["UTC", 0], ["PST (UTC-8)", -8], ["PDT (UTC-7)", -7]]
     y0 := headerH + 6
-    for i, z in zones {
+    ; 数据行整行可点即复制：名称和值都响应点击(0x100=SS_NOTIFY)，鼠标移上去变手形，值用链接蓝提示可点
+    gTzCopyHwnds := Map()
+    for i, name in rowNames {
         yy := y0 + (i - 1) * rowH
-        tzGui.Add("Text", "x" padX " y" (yy + 3) " w118", z[1])
+        lbl := tzGui.Add("Text", "x" padX " y" (yy + 3) " w118 0x100", name)
+        tzGui.SetFont("c0563C1")
         out := tzGui.Add("Text", "x" (padX + 122) " y" (yy + 3) " w" (winW - padX - 122 - 8) " 0x100", "—")
+        tzGui.SetFont("c202020")
+        lbl.OnEvent("Click", CopyTz.Bind(out))
         out.OnEvent("Click", CopyTz.Bind(out))
-        gTzOut[z[1]] := out
+        gTzCopyHwnds[lbl.Hwnd] := true, gTzCopyHwnds[out.Hwnd] := true
+        gTzOut[name] := out
     }
 
     nowb.OnEvent("Click", (*) => (gTzInput.Value := TzNowSeconds(), RefreshTz()))
@@ -1495,27 +1576,80 @@ OpenTimeConverter(*) {
     RefreshTz()
 }
 
-; 重算并刷新四个时区显示
+; 识别输入 → 刷新时间戳两行 + 各时区时间
 RefreshTz() {
-    global gTzInput, gTzOut
+    global gTzInput, gTzOut, gTzZoneRadios, gTzHint, TzZones
     if (gTzInput = "" || gTzOut = "")
         return
-    digits := RegExReplace(Trim(gTzInput.Value), "\D", "")
-    zones := Map("中国 (UTC+8)", 8, "UTC", 0, "PST (UTC-8)", -8, "PDT (UTC-7)", -7)
-    if (digits = "") {
+    zoneIdx := 1
+    for i, rb in gTzZoneRadios
+        if rb.Value
+            zoneIdx := i
+    r := TzParseInput(gTzInput.Value, TzZones[zoneIdx][2] * 60)
+    gTzHint.Text := r.ok ? r.hint "　·　点下面任一行即复制" : r.hint
+    if (!r.ok) {
         for name, ctrl in gTzOut
             ctrl.Text := "—"
         return
     }
-    ts := Integer(digits)
-    if (StrLen(digits) >= 13)   ; 13 位当毫秒
-        ts := ts // 1000
-    for name, ctrl in gTzOut {
+    gTzOut["秒时间戳"].Text := r.sec
+    gTzOut["毫秒时间戳"].Text := r.sec * 1000 + r.ms
+    for z in TzZones {
         try
-            ctrl.Text := TzFormat(ts, zones[name])
+            gTzOut[z[1]].Text := TzFormat(r.sec, z[2])
         catch
-            ctrl.Text := "（时间戳超出范围）"
+            gTzOut[z[1]].Text := "（超出范围）"
     }
+}
+
+; 解析输入。defaultOffsetMin = 日期没带时区后缀时按的偏移(分钟)
+; 返回 {ok, sec, ms, hint}：sec=Unix 秒，ms=毫秒余数(0~999)，hint=给用户看的识别结果
+TzParseInput(raw, defaultOffsetMin) {
+    s := Trim(raw)
+    if (s = "")
+        return {ok: false, sec: 0, ms: 0, hint: ""}
+
+    ; 纯数字：≤13 位当时间戳（13 位当毫秒）；14 位当紧凑日期 yyyyMMddHHmmss
+    if RegExMatch(s, "^-?\d+$") {
+        len := StrLen(LTrim(s, "-"))
+        if (len = 14 && SubStr(s, 1, 1) != "-")
+            return TzParseDate(SubStr(s, 1, 4), SubStr(s, 5, 2), SubStr(s, 7, 2)
+                , SubStr(s, 9, 2), SubStr(s, 11, 2), SubStr(s, 13, 2), "", "", defaultOffsetMin)
+        if (len > 13)
+            return {ok: false, sec: 0, ms: 0, hint: "位数太多，认不出"}
+        n := Integer(s)
+        if (len = 13)
+            return {ok: true, sec: Floor(n / 1000), ms: Mod(Mod(n, 1000) + 1000, 1000), hint: "识别为：毫秒时间戳"}
+        return {ok: true, sec: n, ms: 0, hint: "识别为：秒时间戳"}
+    }
+
+    ; 日期：年 月 日 [时:分[:秒[.小数]]] [Z / ±HH:MM / UTC / GMT]，分隔符认 - / . 年月日 T 空格
+    pat := "i)^(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*日?"
+         . "(?:(?:T|\s)+(\d{1,2})\s*[:时点]\s*(\d{1,2})(?:\s*[:分]\s*(\d{1,2})\s*秒?)?(?:[.,](\d+))?)?"
+         . "\s*(Z|UTC|GMT|[+-]\d{1,2}(?::?\d{2})?)?$"
+    if !RegExMatch(s, pat, &m)
+        return {ok: false, sec: 0, ms: 0, hint: "格式认不出"}
+    return TzParseDate(m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], defaultOffsetMin)
+}
+
+; 日期各段 → Unix 秒。zoneSuffix 为空时按 defaultOffsetMin 理解
+TzParseDate(y, mo, d, h, mi, sec, frac, zoneSuffix, defaultOffsetMin) {
+    stamp := Format("{:04d}{:02d}{:02d}{:02d}{:02d}{:02d}", Integer(y), Integer(mo), Integer(d)
+        , h = "" ? 0 : Integer(h), mi = "" ? 0 : Integer(mi), sec = "" ? 0 : Integer(sec))
+    if !IsTime(stamp)
+        return {ok: false, sec: 0, ms: 0, hint: "日期不存在"}
+
+    offsetMin := defaultOffsetMin, zoneText := "按所选时区"
+    if (zoneSuffix != "") {
+        zoneText := "按日期自带时区"
+        if RegExMatch(zoneSuffix, "^([+-])(\d{1,2}):?(\d{2})?$", &z)
+            offsetMin := (z[1] = "-" ? -1 : 1) * (Integer(z[2]) * 60 + (z[3] = "" ? 0 : Integer(z[3])))
+        else
+            offsetMin := 0   ; Z / UTC / GMT
+    }
+    utc := DateAdd(stamp, -offsetMin, "Minutes")
+    ms := frac = "" ? 0 : Integer(SubStr(frac "00", 1, 3))
+    return {ok: true, sec: DateDiff(utc, "19700101000000", "Seconds"), ms: ms, hint: "识别为：日期（" zoneText "）"}
 }
 
 ; Unix 秒 + 时区偏移(小时) → "yyyy-MM-dd HH:mm:ss 周X"
@@ -1532,12 +1666,29 @@ TzNowSeconds() {
 }
 
 ; 点某行时间 → 复制到剪贴板，短暂提示
+; 日期行复制时去掉末尾的「周X」，拿去写 SQL / 填参数可直接用；复制后该值闪绿一下
 CopyTz(ctrl, *) {
-    if (ctrl.Text = "" || ctrl.Text = "—")
+    if (ctrl.Text = "" || ctrl.Text = "—" || SubStr(ctrl.Text, 1, 1) = "（")
         return
-    A_Clipboard := ctrl.Text
-    ToolTip("已复制：" ctrl.Text)
+    text := RegExReplace(ctrl.Text, "\s+周.$")
+    A_Clipboard := text
+    ctrl.SetFont("c1E8E3E w700")
+    SetTimer(() => TzUnflash(ctrl), -600)
+    ToolTip("已复制：" text)
     SetTimer(() => ToolTip(), -900)
+}
+
+TzUnflash(ctrl) {
+    try ctrl.SetFont("c0563C1 w400")   ; 面板 600ms 内被关掉/重建时控件已销毁，忽略
+}
+
+; 鼠标移到时间面板的数据行上显示手形光标(WM_SETCURSOR，wParam=光标下的窗口)
+TzSetCursor(wParam, lParam, msg, hwnd) {
+    global gTzCopyHwnds
+    if (gTzCopyHwnds.Has(wParam)) {
+        DllCall("SetCursor", "Ptr", DllCall("LoadCursor", "Ptr", 0, "Ptr", 32649, "Ptr"))   ; IDC_HAND
+        return true
+    }
 }
 
 ; ============================== 退出保存 =====================================
